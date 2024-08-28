@@ -1,5 +1,12 @@
-import os
+import hashlib
+import json
 import logging
+import os
+import uuid
+from functools import lru_cache
+from pathlib import Path
+
+import requests
 from fastapi import (
     FastAPI,
     Request,
@@ -8,34 +15,14 @@ from fastapi import (
     status,
     UploadFile,
     File,
-    Form,
 )
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
-
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
-
-from typing import List
-import uuid
-import requests
-import hashlib
-from pathlib import Path
-import json
-
-from constants import ERROR_MESSAGES
-from utils.utils import (
-    decode_token,
-    get_current_user,
-    get_verified_user,
-    get_admin_user,
-)
-from utils.misc import calculate_sha256
-
 
 from config import (
     SRC_LOG_LEVELS,
     CACHE_DIR,
-    UPLOAD_DIR,
     WHISPER_MODEL,
     WHISPER_MODEL_DIR,
     WHISPER_MODEL_AUTO_UPDATE,
@@ -50,7 +37,15 @@ from config import (
     AUDIO_TTS_ENGINE,
     AUDIO_TTS_MODEL,
     AUDIO_TTS_VOICE,
+    AUDIO_TTS_SPLIT_ON,
     AppConfig,
+    CORS_ALLOW_ORIGIN,
+)
+from constants import ERROR_MESSAGES
+from utils.utils import (
+    get_current_user,
+    get_verified_user,
+    get_admin_user,
 )
 
 log = logging.getLogger(__name__)
@@ -59,7 +54,7 @@ log.setLevel(SRC_LOG_LEVELS["AUDIO"])
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGIN,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -78,6 +73,7 @@ app.state.config.TTS_ENGINE = AUDIO_TTS_ENGINE
 app.state.config.TTS_MODEL = AUDIO_TTS_MODEL
 app.state.config.TTS_VOICE = AUDIO_TTS_VOICE
 app.state.config.TTS_API_KEY = AUDIO_TTS_API_KEY
+app.state.config.TTS_SPLIT_ON = AUDIO_TTS_SPLIT_ON
 
 # setting device type for whisper model
 whisper_device_type = DEVICE_TYPE if DEVICE_TYPE and DEVICE_TYPE == "cuda" else "cpu"
@@ -94,6 +90,7 @@ class TTSConfigForm(BaseModel):
     ENGINE: str
     MODEL: str
     VOICE: str
+    SPLIT_ON: str
 
 
 class STTConfigForm(BaseModel):
@@ -145,6 +142,7 @@ async def get_audio_config(user=Depends(get_admin_user)):
             "ENGINE": app.state.config.TTS_ENGINE,
             "MODEL": app.state.config.TTS_MODEL,
             "VOICE": app.state.config.TTS_VOICE,
+            "SPLIT_ON": app.state.config.TTS_SPLIT_ON,
         },
         "stt": {
             "OPENAI_API_BASE_URL": app.state.config.STT_OPENAI_API_BASE_URL,
@@ -165,6 +163,7 @@ async def update_audio_config(
     app.state.config.TTS_ENGINE = form_data.tts.ENGINE
     app.state.config.TTS_MODEL = form_data.tts.MODEL
     app.state.config.TTS_VOICE = form_data.tts.VOICE
+    app.state.config.TTS_SPLIT_ON = form_data.tts.SPLIT_ON
 
     app.state.config.STT_OPENAI_API_BASE_URL = form_data.stt.OPENAI_API_BASE_URL
     app.state.config.STT_OPENAI_API_KEY = form_data.stt.OPENAI_API_KEY
@@ -179,6 +178,7 @@ async def update_audio_config(
             "ENGINE": app.state.config.TTS_ENGINE,
             "MODEL": app.state.config.TTS_MODEL,
             "VOICE": app.state.config.TTS_VOICE,
+            "SPLIT_ON": app.state.config.TTS_SPLIT_ON,
         },
         "stt": {
             "OPENAI_API_BASE_URL": app.state.config.STT_OPENAI_API_BASE_URL,
@@ -244,7 +244,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
                     res = r.json()
                     if "error" in res:
                         error_detail = f"External: {res['error']['message']}"
-                except:
+                except Exception:
                     error_detail = f"External: {e}"
 
             raise HTTPException(
@@ -261,6 +261,13 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
         voice_id = payload.get("voice", "")
+
+        if voice_id not in get_available_voices():
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid voice id",
+            )
+
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 
         headers = {
@@ -299,7 +306,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
                     res = r.json()
                     if "error" in res:
                         error_detail = f"External: {res['error']['message']}"
-                except:
+                except Exception:
                     error_detail = f"External: {e}"
 
             raise HTTPException(
@@ -353,7 +360,7 @@ def transcribe(
 
             try:
                 model = WhisperModel(**whisper_kwargs)
-            except:
+            except Exception:
                 log.warning(
                     "WhisperModel initialization failed, attempting download with local_files_only=False"
                 )
@@ -421,7 +428,7 @@ def transcribe(
                         res = r.json()
                         if "error" in res:
                             error_detail = f"External: {res['error']['message']}"
-                    except:
+                    except Exception:
                         error_detail = f"External: {e}"
 
                 raise HTTPException(
@@ -438,7 +445,7 @@ def transcribe(
         )
 
 
-def get_available_models() -> List[dict]:
+def get_available_models() -> list[dict]:
     if app.state.config.TTS_ENGINE == "openai":
         return [{"id": "tts-1"}, {"id": "tts-1-hd"}]
     elif app.state.config.TTS_ENGINE == "elevenlabs":
@@ -466,39 +473,58 @@ async def get_models(user=Depends(get_verified_user)):
     return {"models": get_available_models()}
 
 
-def get_available_voices() -> List[dict]:
+def get_available_voices() -> dict:
+    """Returns {voice_id: voice_name} dict"""
+    ret = {}
     if app.state.config.TTS_ENGINE == "openai":
-        return [
-            {"name": "alloy", "id": "alloy"},
-            {"name": "echo", "id": "echo"},
-            {"name": "fable", "id": "fable"},
-            {"name": "onyx", "id": "onyx"},
-            {"name": "nova", "id": "nova"},
-            {"name": "shimmer", "id": "shimmer"},
-        ]
-    elif app.state.config.TTS_ENGINE == "elevenlabs":
-        headers = {
-            "xi-api-key": app.state.config.TTS_API_KEY,
-            "Content-Type": "application/json",
+        ret = {
+            "alloy": "alloy",
+            "echo": "echo",
+            "fable": "fable",
+            "onyx": "onyx",
+            "nova": "nova",
+            "shimmer": "shimmer",
         }
-
+    elif app.state.config.TTS_ENGINE == "elevenlabs":
         try:
-            response = requests.get(
-                "https://api.elevenlabs.io/v1/voices", headers=headers
-            )
-            response.raise_for_status()
-            voices_data = response.json()
+            ret = get_elevenlabs_voices()
+        except Exception as e:
+            # Avoided @lru_cache with exception
+            pass
 
-            voices = []
-            for voice in voices_data.get("voices", []):
-                voices.append({"name": voice["name"], "id": voice["voice_id"]})
-            return voices
-        except requests.RequestException as e:
-            log.error(f"Error fetching voices: {str(e)}")
+    return ret
 
-    return []
+
+@lru_cache
+def get_elevenlabs_voices() -> dict:
+    """
+    Note, set the following in your .env file to use Elevenlabs:
+    AUDIO_TTS_ENGINE=elevenlabs
+    AUDIO_TTS_API_KEY=sk_...  # Your Elevenlabs API key
+    AUDIO_TTS_VOICE=EXAVITQu4vr4xnSDxMaL  # From https://api.elevenlabs.io/v1/voices
+    AUDIO_TTS_MODEL=eleven_multilingual_v2
+    """
+    headers = {
+        "xi-api-key": app.state.config.TTS_API_KEY,
+        "Content-Type": "application/json",
+    }
+    try:
+        # TODO: Add retries
+        response = requests.get("https://api.elevenlabs.io/v1/voices", headers=headers)
+        response.raise_for_status()
+        voices_data = response.json()
+
+        voices = {}
+        for voice in voices_data.get("voices", []):
+            voices[voice["voice_id"]] = voice["name"]
+    except requests.RequestException as e:
+        # Avoid @lru_cache with exception
+        log.error(f"Error fetching voices: {str(e)}")
+        raise RuntimeError(f"Error fetching voices: {str(e)}")
+
+    return voices
 
 
 @app.get("/voices")
 async def get_voices(user=Depends(get_verified_user)):
-    return {"voices": get_available_voices()}
+    return {"voices": [{"id": k, "name": v} for k, v in get_available_voices().items()]}

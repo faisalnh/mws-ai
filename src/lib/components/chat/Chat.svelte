@@ -3,13 +3,13 @@
 	import { toast } from 'svelte-sonner';
 	import mermaid from 'mermaid';
 
-	import { getContext, onMount, tick } from 'svelte';
+	import { getContext, onDestroy, onMount, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 
-	import type { Writable } from 'svelte/store';
+	import type { Unsubscriber, Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
-	import { OLLAMA_API_BASE_URL, OPENAI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
+	import { WEBUI_BASE_URL } from '$lib/constants';
 
 	import {
 		chatId,
@@ -19,30 +19,26 @@
 		models,
 		settings,
 		showSidebar,
-		tags as _tags,
 		WEBUI_NAME,
 		banners,
 		user,
 		socket,
 		showCallOverlay,
-		tools,
-		currentChatPage
+		currentChatPage,
+		temporaryChatEnabled
 	} from '$lib/stores';
 	import {
 		convertMessagesToHistory,
 		copyToClipboard,
+		getMessageContentParts,
 		extractSentencesForAudio,
-		getUserPosition,
 		promptTemplate,
 		splitStream
 	} from '$lib/utils';
 
 	import { generateChatCompletion } from '$lib/apis/ollama';
 	import {
-		addTagById,
 		createNewChat,
-		deleteTagById,
-		getAllChatTags,
 		getChatById,
 		getChatList,
 		getTagsById,
@@ -53,14 +49,18 @@
 	import { createOpenAITextStream } from '$lib/apis/streaming';
 	import { queryMemory } from '$lib/apis/memories';
 	import { getAndUpdateUserLocation, getUserSettings } from '$lib/apis/users';
-	import { chatCompleted, generateTitle, generateSearchQuery, chatAction } from '$lib/apis';
+	import {
+		chatCompleted,
+		generateTitle,
+		generateSearchQuery,
+		chatAction,
+		generateMoACompletion
+	} from '$lib/apis';
 
 	import Banner from '../common/Banner.svelte';
 	import MessageInput from '$lib/components/chat/MessageInput.svelte';
 	import Messages from '$lib/components/chat/Messages.svelte';
 	import Navbar from '$lib/components/layout/Navbar.svelte';
-	import CallOverlay from './MessageInput/CallOverlay.svelte';
-	import { error } from '@sveltejs/kit';
 	import ChatControls from './ChatControls.svelte';
 	import EventConfirmDialog from '../common/ConfirmDialog.svelte';
 
@@ -110,6 +110,8 @@
 	};
 
 	let params = {};
+
+	let chatIdUnsubscriber: Unsubscriber | undefined;
 
 	$: if (history.currentId !== null) {
 		let _messages = [];
@@ -166,6 +168,14 @@
 				message.content += data.content;
 			} else if (type === 'replace') {
 				message.content = data.content;
+			} else if (type === 'action') {
+				if (data.action === 'continue') {
+					const continueButton = document.getElementById('continue-response-button');
+
+					if (continueButton) {
+						continueButton.click();
+					}
+				}
 			} else if (type === 'confirmation') {
 				eventCallback = cb;
 
@@ -192,62 +202,66 @@
 		}
 	};
 
-	onMount(async () => {
-		const onMessageHandler = async (event) => {
-			if (event.origin === window.origin) {
-				// Replace with your iframe's origin
-				console.log('Message received from iframe:', event.data);
-				if (event.data.type === 'input:prompt') {
-					console.log(event.data.text);
+	const onMessageHandler = async (event: {
+		origin: string;
+		data: { type: string; text: string };
+	}) => {
+		if (event.origin !== window.origin) {
+			return;
+		}
 
-					const inputElement = document.getElementById('chat-textarea');
+		// Replace with your iframe's origin
+		if (event.data.type === 'input:prompt') {
+			console.debug(event.data.text);
 
-					if (inputElement) {
-						prompt = event.data.text;
-						inputElement.focus();
-					}
-				}
+			const inputElement = document.getElementById('chat-textarea');
 
-				if (event.data.type === 'action:submit') {
-					console.log(event.data.text);
-
-					if (prompt !== '') {
-						await tick();
-						submitPrompt(prompt);
-					}
-				}
-
-				if (event.data.type === 'input:prompt:submit') {
-					console.log(event.data.text);
-
-					if (prompt !== '') {
-						await tick();
-						submitPrompt(event.data.text);
-					}
-				}
+			if (inputElement) {
+				prompt = event.data.text;
+				inputElement.focus();
 			}
-		};
-		window.addEventListener('message', onMessageHandler);
+		}
 
-		$socket.on('chat-events', chatEventHandler);
+		if (event.data.type === 'action:submit') {
+			console.debug(event.data.text);
+
+			if (prompt !== '') {
+				await tick();
+				submitPrompt(prompt);
+			}
+		}
+
+		if (event.data.type === 'input:prompt:submit') {
+			console.debug(event.data.text);
+
+			if (prompt !== '') {
+				await tick();
+				submitPrompt(event.data.text);
+			}
+		}
+	};
+
+	onMount(async () => {
+		window.addEventListener('message', onMessageHandler);
+		$socket?.on('chat-events', chatEventHandler);
 
 		if (!$chatId) {
-			chatId.subscribe(async (value) => {
+			chatIdUnsubscriber = chatId.subscribe(async (value) => {
 				if (!value) {
 					await initNewChat();
 				}
 			});
 		} else {
-			if (!($settings.saveChatHistory ?? true)) {
+			if ($temporaryChatEnabled) {
 				await goto('/');
 			}
 		}
+	});
 
-		return () => {
-			window.removeEventListener('message', onMessageHandler);
-
-			$socket.off('chat-events');
-		};
+	onDestroy(() => {
+		chatIdUnsubscriber?.();
+		window.removeEventListener('message', onMessageHandler);
+		$socket?.off('chat-events');
 	});
 
 	//////////////////////////
@@ -255,9 +269,11 @@
 	//////////////////////////
 
 	const initNewChat = async () => {
-		window.history.replaceState(history.state, '', `/`);
-		await chatId.set('');
+		if ($page.url.pathname.includes('/c/')) {
+			window.history.replaceState(history.state, '', `/`);
+		}
 
+		await chatId.set('');
 		autoScroll = true;
 
 		title = '';
@@ -292,6 +308,10 @@
 				await tick();
 				submitPrompt(prompt);
 			}
+		}
+
+		if ($page.url.searchParams.get('call') === 'true') {
+			showCallOverlay.set(true);
 		}
 
 		selectedModels = selectedModels.map((modelId) =>
@@ -414,7 +434,7 @@
 		}
 
 		if ($chatId == chatId) {
-			if ($settings.saveChatHistory ?? true) {
+			if (!$temporaryChatEnabled) {
 				chat = await updateChatById(localStorage.token, chatId, {
 					models: selectedModels,
 					messages: messages,
@@ -429,7 +449,7 @@
 		}
 	};
 
-	const chatActionHandler = async (chatId, actionId, modelId, responseMessageId) => {
+	const chatActionHandler = async (chatId, actionId, modelId, responseMessageId, event = null) => {
 		const res = await chatAction(localStorage.token, actionId, {
 			model: modelId,
 			messages: messages.map((m) => ({
@@ -439,6 +459,7 @@
 				info: m.info ? m.info : undefined,
 				timestamp: m.timestamp
 			})),
+			...(event ? { event: event } : {}),
 			chat_id: chatId,
 			session_id: $socket?.id,
 			id: responseMessageId
@@ -462,7 +483,7 @@
 		}
 
 		if ($chatId == chatId) {
-			if ($settings.saveChatHistory ?? true) {
+			if (!$temporaryChatEnabled) {
 				chat = await updateChatById(localStorage.token, chatId, {
 					models: selectedModels,
 					messages: messages,
@@ -521,6 +542,16 @@
 					`Oops! Hold tight! Your files are still in the processing oven. We're cooking them up to perfection. Please be patient and we'll let you know once they're ready.`
 				)
 			);
+		} else if (
+			($config?.file?.max_count ?? null) !== null &&
+			files.length + chatFiles.length > $config?.file?.max_count
+		) {
+			console.log(chatFiles.length, files.length);
+			toast.error(
+				$i18n.t(`You can only chat with a maximum of {{maxCount}} file(s) at a time.`, {
+					maxCount: $config?.file?.max_count
+				})
+			);
 		} else {
 			// Reset chat input textarea
 			const chatTextAreaElement = document.getElementById('chat-textarea');
@@ -552,7 +583,7 @@
 				content: userPrompt,
 				files: _files.length > 0 ? _files : undefined,
 				timestamp: Math.floor(Date.now() / 1000), // Unix epoch
-				models: selectedModels.filter((m, mIdx) => selectedModels.indexOf(m) === mIdx)
+				models: selectedModels
 			};
 
 			// Add message to history and Set currentId to messageId
@@ -572,19 +603,23 @@
 		return _responses;
 	};
 
-	const sendPrompt = async (prompt, parentId, { modelId = null, newChat = false } = {}) => {
-		let _responses = [];
+	const sendPrompt = async (
+		prompt: string,
+		parentId: string,
+		{ modelId = null, modelIdx = null, newChat = false } = {}
+	) => {
+		let _responses: string[] = [];
 
 		// If modelId is provided, use it, else use selected model
 		let selectedModelIds = modelId
 			? [modelId]
 			: atSelectedModel !== undefined
-			? [atSelectedModel.id]
-			: selectedModels;
+				? [atSelectedModel.id]
+				: selectedModels;
 
 		// Create response messages for each selected model
-		const responseMessageIds = {};
-		for (const modelId of selectedModelIds) {
+		const responseMessageIds: Record<PropertyKey, string> = {};
+		for (const [_modelIdx, modelId] of selectedModelIds.entries()) {
 			const model = $models.filter((m) => m.id === modelId).at(0);
 
 			if (model) {
@@ -597,6 +632,7 @@
 					content: '',
 					model: model.id,
 					modelName: model.name ?? model.id,
+					modelIdx: modelIdx ? modelIdx : _modelIdx,
 					userContext: null,
 					timestamp: Math.floor(Date.now() / 1000) // Unix epoch
 				};
@@ -613,14 +649,14 @@
 					];
 				}
 
-				responseMessageIds[modelId] = responseMessageId;
+				responseMessageIds[`${modelId}-${modelIdx ? modelIdx : _modelIdx}`] = responseMessageId;
 			}
 		}
 		await tick();
 
 		// Create new chat if only one message in messages
 		if (newChat && messages.length == 2) {
-			if ($settings.saveChatHistory ?? true) {
+			if (!$temporaryChatEnabled) {
 				chat = await createNewChat(localStorage.token, {
 					id: $chatId,
 					title: $i18n.t('New Chat'),
@@ -645,7 +681,7 @@
 		const _chatId = JSON.parse(JSON.stringify($chatId));
 
 		await Promise.all(
-			selectedModelIds.map(async (modelId) => {
+			selectedModelIds.map(async (modelId, _modelIdx) => {
 				console.log('modelId', modelId);
 				const model = $models.filter((m) => m.id === modelId).at(0);
 
@@ -663,7 +699,8 @@
 						);
 					}
 
-					let responseMessageId = responseMessageIds[modelId];
+					let responseMessageId =
+						responseMessageIds[`${modelId}-${modelIdx ? modelIdx : _modelIdx}`];
 					let responseMessage = history.messages[responseMessageId];
 
 					let userContext = null;
@@ -711,13 +748,13 @@
 		);
 
 		currentChatPage.set(1);
-		await chats.set(await getChatList(localStorage.token, $currentChatPage));
+		chats.set(await getChatList(localStorage.token, $currentChatPage));
 
 		return _responses;
 	};
 
 	const sendPromptOllama = async (model, userPrompt, responseMessageId, _chatId) => {
-		let _response = null;
+		let _response: string | null = null;
 
 		const responseMessage = history.messages[responseMessageId];
 		const userMessage = history.messages[responseMessage.parentId];
@@ -739,16 +776,16 @@
 								? await getAndUpdateUserLocation(localStorage.token)
 								: undefined
 						)}${
-							responseMessage?.userContext ?? null
+							(responseMessage?.userContext ?? null)
 								? `\n\nUser Context:\n${responseMessage?.userContext ?? ''}`
 								: ''
 						}`
-				  }
+					}
 				: undefined,
 			...messages
 		]
 			.filter((message) => message?.content?.trim())
-			.map((message, idx, arr) => {
+			.map((message) => {
 				// Prepare the base message object
 				const baseMessage = {
 					role: message.role,
@@ -785,7 +822,18 @@
 
 		let files = JSON.parse(JSON.stringify(chatFiles));
 		if (model?.info?.meta?.knowledge ?? false) {
+			// Only initialize and add status if knowledge exists
+			responseMessage.statusHistory = [
+				{
+					action: 'knowledge_search',
+					description: $i18n.t(`Searching Knowledge for "{{searchQuery}}"`, {
+						searchQuery: userMessage.content
+					}),
+					done: false
+				}
+			];
 			files.push(...model.info.meta.knowledge);
+			messages = messages; // Trigger Svelte update
 		}
 		files.push(
 			...(userMessage?.files ?? []).filter((item) =>
@@ -793,6 +841,8 @@
 			),
 			...(responseMessage?.files ?? []).filter((item) => ['web_search_results'].includes(item.type))
 		);
+
+		scrollToBottom();
 
 		eventTarget.dispatchEvent(
 			new CustomEvent('chat:start', {
@@ -811,10 +861,10 @@
 			options: {
 				...(params ?? $settings.params ?? {}),
 				stop:
-					params?.stop ?? $settings?.params?.stop ?? undefined
+					(params?.stop ?? $settings?.params?.stop ?? undefined)
 						? (params?.stop.split(',').map((token) => token.trim()) ?? $settings.params.stop).map(
 								(str) => decodeURIComponent(JSON.parse('"' + str.replace(/\"/g, '\\"') + '"'))
-						  )
+							)
 						: undefined,
 				num_predict: params?.max_tokens ?? $settings?.params?.max_tokens ?? undefined,
 				repeat_penalty:
@@ -864,6 +914,12 @@
 
 							if ('citations' in data) {
 								responseMessage.citations = data.citations;
+								// Only remove status if it was initially set
+								if (model?.info?.meta?.knowledge ?? false) {
+									responseMessage.statusHistory = responseMessage.statusHistory.filter(
+										(status) => status.action !== 'knowledge_search'
+									);
+								}
 								continue;
 							}
 
@@ -877,18 +933,30 @@
 								} else {
 									responseMessage.content += data.message.content;
 
-									const sentences = extractSentencesForAudio(responseMessage.content);
-									sentences.pop();
+									if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
+										navigator.vibrate(5);
+									}
+
+									const messageContentParts = getMessageContentParts(
+										responseMessage.content,
+										$config?.audio?.tts?.split_on ?? 'punctuation'
+									);
+									messageContentParts.pop();
 
 									// dispatch only last sentence and make sure it hasn't been dispatched before
 									if (
-										sentences.length > 0 &&
-										sentences[sentences.length - 1] !== responseMessage.lastSentence
+										messageContentParts.length > 0 &&
+										messageContentParts[messageContentParts.length - 1] !==
+											responseMessage.lastSentence
 									) {
-										responseMessage.lastSentence = sentences[sentences.length - 1];
+										responseMessage.lastSentence =
+											messageContentParts[messageContentParts.length - 1];
 										eventTarget.dispatchEvent(
 											new CustomEvent('chat', {
-												detail: { id: responseMessageId, content: sentences[sentences.length - 1] }
+												detail: {
+													id: responseMessageId,
+													content: messageContentParts[messageContentParts.length - 1]
+												}
 											})
 										);
 									}
@@ -985,20 +1053,32 @@
 				};
 			}
 			responseMessage.done = true;
+
+			if (responseMessage.statusHistory) {
+				responseMessage.statusHistory = responseMessage.statusHistory.filter(
+					(status) => status.action !== 'knowledge_search'
+				);
+			}
+
 			messages = messages;
 		}
 
 		stopResponseFlag = false;
 		await tick();
 
-		let lastSentence = extractSentencesForAudio(responseMessage.content)?.at(-1) ?? '';
-		if (lastSentence) {
+		let lastMessageContentPart =
+			getMessageContentParts(
+				responseMessage.content,
+				$config?.audio?.tts?.split_on ?? 'punctuation'
+			)?.at(-1) ?? '';
+		if (lastMessageContentPart) {
 			eventTarget.dispatchEvent(
 				new CustomEvent('chat', {
-					detail: { id: responseMessageId, content: lastSentence }
+					detail: { id: responseMessageId, content: lastMessageContentPart }
 				})
 			);
 		}
+
 		eventTarget.dispatchEvent(
 			new CustomEvent('chat:finish', {
 				detail: {
@@ -1029,7 +1109,18 @@
 
 		let files = JSON.parse(JSON.stringify(chatFiles));
 		if (model?.info?.meta?.knowledge ?? false) {
+			// Only initialize and add status if knowledge exists
+			responseMessage.statusHistory = [
+				{
+					action: 'knowledge_search',
+					description: $i18n.t(`Searching Knowledge for "{{searchQuery}}"`, {
+						searchQuery: userMessage.content
+					}),
+					done: false
+				}
+			];
 			files.push(...model.info.meta.knowledge);
+			messages = messages; // Trigger Svelte update
 		}
 		files.push(
 			...(userMessage?.files ?? []).filter((item) =>
@@ -1056,10 +1147,10 @@
 					stream: true,
 					model: model.id,
 					stream_options:
-						model.info?.meta?.capabilities?.usage ?? false
+						(model.info?.meta?.capabilities?.usage ?? false)
 							? {
 									include_usage: true
-							  }
+								}
 							: undefined,
 					messages: [
 						params?.system || $settings.system || (responseMessage?.userContext ?? null)
@@ -1072,11 +1163,11 @@
 											? await getAndUpdateUserLocation(localStorage.token)
 											: undefined
 									)}${
-										responseMessage?.userContext ?? null
+										(responseMessage?.userContext ?? null)
 											? `\n\nUser Context:\n${responseMessage?.userContext ?? ''}`
 											: ''
 									}`
-							  }
+								}
 							: undefined,
 						...messages
 					]
@@ -1092,7 +1183,7 @@
 												text:
 													arr.length - 1 !== idx
 														? message.content
-														: message?.raContent ?? message.content
+														: (message?.raContent ?? message.content)
 											},
 											...message.files
 												.filter((file) => file.type === 'image')
@@ -1103,20 +1194,20 @@
 													}
 												}))
 										]
-								  }
+									}
 								: {
 										content:
 											arr.length - 1 !== idx
 												? message.content
-												: message?.raContent ?? message.content
-								  })
+												: (message?.raContent ?? message.content)
+									})
 						})),
 					seed: params?.seed ?? $settings?.params?.seed ?? undefined,
 					stop:
-						params?.stop ?? $settings?.params?.stop ?? undefined
+						(params?.stop ?? $settings?.params?.stop ?? undefined)
 							? (params?.stop.split(',').map((token) => token.trim()) ?? $settings.params.stop).map(
 									(str) => decodeURIComponent(JSON.parse('"' + str.replace(/\"/g, '\\"') + '"'))
-							  )
+								)
 							: undefined,
 					temperature: params?.temperature ?? $settings?.params?.temperature ?? undefined,
 					top_p: params?.top_p ?? $settings?.params?.top_p ?? undefined,
@@ -1169,6 +1260,12 @@
 
 					if (citations) {
 						responseMessage.citations = citations;
+						// Only remove status if it was initially set
+						if (model?.info?.meta?.knowledge ?? false) {
+							responseMessage.statusHistory = responseMessage.statusHistory.filter(
+								(status) => status.action !== 'knowledge_search'
+							);
+						}
 						continue;
 					}
 
@@ -1177,18 +1274,28 @@
 					} else {
 						responseMessage.content += value;
 
-						const sentences = extractSentencesForAudio(responseMessage.content);
-						sentences.pop();
+						if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
+							navigator.vibrate(5);
+						}
+
+						const messageContentParts = getMessageContentParts(
+							responseMessage.content,
+							$config?.audio?.tts?.split_on ?? 'punctuation'
+						);
+						messageContentParts.pop();
 
 						// dispatch only last sentence and make sure it hasn't been dispatched before
 						if (
-							sentences.length > 0 &&
-							sentences[sentences.length - 1] !== responseMessage.lastSentence
+							messageContentParts.length > 0 &&
+							messageContentParts[messageContentParts.length - 1] !== responseMessage.lastSentence
 						) {
-							responseMessage.lastSentence = sentences[sentences.length - 1];
+							responseMessage.lastSentence = messageContentParts[messageContentParts.length - 1];
 							eventTarget.dispatchEvent(
 								new CustomEvent('chat', {
-									detail: { id: responseMessageId, content: sentences[sentences.length - 1] }
+									detail: {
+										id: responseMessageId,
+										content: messageContentParts[messageContentParts.length - 1]
+									}
 								})
 							);
 						}
@@ -1243,11 +1350,15 @@
 		stopResponseFlag = false;
 		await tick();
 
-		let lastSentence = extractSentencesForAudio(responseMessage.content)?.at(-1) ?? '';
-		if (lastSentence) {
+		let lastMessageContentPart =
+			getMessageContentParts(
+				responseMessage.content,
+				$config?.audio?.tts?.split_on ?? 'punctuation'
+			)?.at(-1) ?? '';
+		if (lastMessageContentPart) {
 			eventTarget.dispatchEvent(
 				new CustomEvent('chat', {
-					detail: { id: responseMessageId, content: lastSentence }
+					detail: { id: responseMessageId, content: lastMessageContentPart }
 				})
 			);
 		}
@@ -1311,6 +1422,12 @@
 		};
 		responseMessage.done = true;
 
+		if (responseMessage.statusHistory) {
+			responseMessage.statusHistory = responseMessage.statusHistory.filter(
+				(status) => status.action !== 'knowledge_search'
+			);
+		}
+
 		messages = messages;
 	};
 
@@ -1332,7 +1449,10 @@
 			} else {
 				// If there are multiple models selected, use the model of the response message for regeneration
 				// e.g. many model chat
-				await sendPrompt(userPrompt, userMessage.id, { modelId: message.model });
+				await sendPrompt(userPrompt, userMessage.id, {
+					modelId: message.model,
+					modelIdx: message.modelIdx
+				});
 			}
 		}
 	};
@@ -1392,7 +1512,7 @@
 			title = _title;
 		}
 
-		if ($settings.saveChatHistory ?? true) {
+		if (!$temporaryChatEnabled) {
 			chat = await updateChatById(localStorage.token, _chatId, { title: _title });
 
 			currentChatPage.set(1);
@@ -1484,6 +1604,69 @@
 			return [];
 		});
 	};
+
+	const saveChatHandler = async (_chatId) => {
+		if ($chatId == _chatId) {
+			if (!$temporaryChatEnabled) {
+				chat = await updateChatById(localStorage.token, _chatId, {
+					messages: messages,
+					history: history,
+					models: selectedModels,
+					params: params,
+					files: chatFiles
+				});
+
+				currentChatPage.set(1);
+				await chats.set(await getChatList(localStorage.token, $currentChatPage));
+			}
+		}
+	};
+	const mergeResponses = async (messageId, responses, _chatId) => {
+		console.log('mergeResponses', messageId, responses);
+		const message = history.messages[messageId];
+		const mergedResponse = {
+			status: true,
+			content: ''
+		};
+		message.merged = mergedResponse;
+		messages = messages;
+
+		try {
+			const [res, controller] = await generateMoACompletion(
+				localStorage.token,
+				message.model,
+				history.messages[message.parentId].content,
+				responses
+			);
+
+			if (res && res.ok && res.body) {
+				const textStream = await createOpenAITextStream(res.body, $settings.splitLargeChunks);
+				for await (const update of textStream) {
+					const { value, done, citations, error, usage } = update;
+					if (error || done) {
+						break;
+					}
+
+					if (mergedResponse.content == '' && value == '\n') {
+						continue;
+					} else {
+						mergedResponse.content += value;
+						messages = messages;
+					}
+
+					if (autoScroll) {
+						scrollToBottom();
+					}
+				}
+
+				await saveChatHandler(_chatId);
+			} else {
+				console.error(res);
+			}
+		} catch (e) {
+			console.error(e);
+		}
+	};
 </script>
 
 <svelte:head>
@@ -1514,17 +1697,6 @@
 		eventCallback(false);
 	}}
 />
-
-{#if $showCallOverlay}
-	<CallOverlay
-		{submitPrompt}
-		{stopResponse}
-		bind:files
-		modelId={selectedModelIds?.at(0) ?? null}
-		chatId={$chatId}
-		{eventTarget}
-	/>
-{/if}
 
 {#if !chatIdProp || (loaded && chatIdProp)}
 	<div
@@ -1610,6 +1782,7 @@
 						{sendPrompt}
 						{continueGeneration}
 						{regenerateResponse}
+						{mergeResponses}
 						{chatActionHandler}
 					/>
 				</div>
@@ -1635,21 +1808,30 @@
 					{messages}
 					{submitPrompt}
 					{stopResponse}
+					on:call={() => {
+						showControls = true;
+					}}
 				/>
 			</div>
 		</div>
-
-		<ChatControls
-			models={selectedModelIds.reduce((a, e, i, arr) => {
-				const model = $models.find((m) => m.id === e);
-				if (model) {
-					return [...a, model];
-				}
-				return a;
-			}, [])}
-			bind:show={showControls}
-			bind:chatFiles
-			bind:params
-		/>
 	</div>
 {/if}
+
+<ChatControls
+	models={selectedModelIds.reduce((a, e, i, arr) => {
+		const model = $models.find((m) => m.id === e);
+		if (model) {
+			return [...a, model];
+		}
+		return a;
+	}, [])}
+	bind:show={showControls}
+	bind:chatFiles
+	bind:params
+	bind:files
+	{submitPrompt}
+	{stopResponse}
+	modelId={selectedModelIds?.at(0) ?? null}
+	chatId={$chatId}
+	{eventTarget}
+/>
